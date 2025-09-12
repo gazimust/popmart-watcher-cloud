@@ -1,0 +1,15 @@
+services:
+  - type: worker
+    name: popmart-watcher
+    env: docker
+    plan: starter
+    autoDeploy: true
+    envVars:
+      - key: CHECK_EVERY_SECONDS
+        value: "45"
+      - key: PUSHOVER_TOKEN
+        sync: false
+      - key: PUSHOVER_USER
+        sync: false
+      - key: SEND_TEST_PUSH_ON_START
+        value: "0"
