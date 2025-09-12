@@ -1,13 +1,19 @@
 FROM python:3.11-slim
 
-# Install Python deps
-RUN pip install --no-cache-dir playwright==1.47.2 requests==2.32.3
+# Install Playwright + Chromium in one go (no manual apt list needed)
+RUN pip install --no-cache-dir --upgrade pip
 
-# Install Chromium + all required OS deps
+# Copy requirements first to leverage Docker layer cache
+WORKDIR /app
+COPY requirements.txt .
+
+# Install Python deps
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install Chromium + all OS deps via Playwright helper
 RUN python -m playwright install --with-deps chromium
 
 # Copy code
-WORKDIR /app
 COPY popmart_stock_watcher.py .
 
 # Run the watcher
