@@ -1,3 +1,11 @@
+# popmart_stock_watcher.py
+# Run in cloud (e.g., Render) as a Background Worker.
+# Env vars (Render → Environment):
+#   PUSHOVER_TOKEN = a8zxubz4ndhfdne8i5ro54n6r8fzib
+#   PUSHOVER_USER  = u7ekcakhmez4v7riffbhjscps8vecs
+#   CHECK_EVERY_SECONDS = 60           (recommended 45–90)
+#   SEND_TEST_PUSH_ON_START = 0 or 1   (optional one-time test on boot)
+
 import asyncio
 import re
 import sys
@@ -19,16 +27,17 @@ PRODUCT_URLS = [
     "https://www.popmart.com/gb/products/733/LABUBU-Time-to-Chill-Vinyl-Plush-Doll",
 ]
 
-CHECK_EVERY_SECONDS = int(os.getenv("CHECK_EVERY_SECONDS", "45"))  # cloud-friendly
+CHECK_EVERY_SECONDS = int(os.getenv("CHECK_EVERY_SECONDS", "60"))  # cloud-friendly default
 OPEN_PAGE_WHEN_IN_STOCK = False  # no GUI in cloud
 
-# Pushover via env vars (safer). You already have these values.
-PUSHOVER_TOKEN = os.getenv("PUSHOVER_TOKEN", "a8zxubz4ndhfdne8i5ro54n6r8fzib")
-PUSHOVER_USER  = os.getenv("PUSHOVER_USER",  "u7ekcakhmez4v7riffbhjscps8vecs")
+# Pushover via env vars (safer). Your values will be injected by Render.
+PUSHOVER_TOKEN = os.getenv("PUSHOVER_TOKEN", "")
+PUSHOVER_USER  = os.getenv("PUSHOVER_USER", "")
 
-# Optional: set SEND_TEST_PUSH_ON_START=1 in Render to get a one-time test push at boot
+# Optional: set 1 to send a one-time push on startup (good for testing)
 SEND_TEST_PUSH_ON_START = os.getenv("SEND_TEST_PUSH_ON_START", "0") == "1"
 
+# Texts used by shops
 CANDIDATE_ADD_TEXTS = [
     "Add to Cart", "Add To Cart", "Add to Bag", "Add To Bag",
     "Add to Basket", "Add To Basket", "Buy Now", "Purchase",
@@ -41,6 +50,7 @@ def log(msg: str) -> None:
     print(f"[{stamp}] {msg}", flush=True)
 
 def iphone_push(title: str, message: str, url: str | None = None):
+    """Send a push to your iPhone via Pushover."""
     if not PUSHOVER_TOKEN or not PUSHOVER_USER:
         log("Pushover not configured; skipping push.")
         return
@@ -55,6 +65,7 @@ def iphone_push(title: str, message: str, url: str | None = None):
         log(f"Pushover exception: {e}")
 
 async def click_if_exists(page, role_name_regex_list):
+    """Try clicking common cookie/consent/close buttons if they appear."""
     for pat in role_name_regex_list:
         try:
             locator = page.get_by_role("button", name=re.compile(pat, re.I))
@@ -100,28 +111,68 @@ async def is_in_stock(page):
         return False
     return False
 
-async def main():
-    log("Starting POP MART stock watcher (cloud)…")
-    async with async_playwright() as p:
-        # ✅ FIX: launch a browser, then create a context
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(user_agent=(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ))
-        page = await context.new_page()
+async def enable_light_mode(context):
+    """
+    Block heavy resources to cut CPU/RAM/network.
+    """
+    async def route_block(route):
+        req = route.request
+        if req.resource_type in ("image", "media", "font", "stylesheet"):
+            return await route.abort()
+        return await route.continue_()
+    await context.route("**/*", route_block)
 
+async def main():
+    log("Starting POP MART stock watcher (cloud, light mode)…")
+    async with async_playwright() as p:
+        # Launch headless Chromium with low-memory flags
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",   # use /tmp instead of /dev/shm
+                "--single-process",          # fewer processes (saves RAM)
+                "--disable-gpu",
+                "--no-zygote",
+            ]
+        )
+
+        # Create a lightweight context
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1024, "height": 700},
+            java_script_enabled=True,
+            accept_downloads=False,
+        )
+
+        # Block heavy resources
+        await enable_light_mode(context)
+
+        page = await context.new_page()
+        page.set_default_navigation_timeout(60000)
+        page.set_default_timeout(20000)
+
+        # Optional one-time test push at boot
         if SEND_TEST_PUSH_ON_START:
             iphone_push("Pushover Test", "Cloud watcher started OK.", PRODUCT_URLS[0])
 
+        # Track previous state to avoid duplicate alerts
         last_seen_instock = {url: False for url in PRODUCT_URLS}
+
+        LOOP_RESTART = 200  # recycle the browser every N loops to avoid leaks
+        loop_count = 0
 
         try:
             while True:
+                loop_count += 1
                 for url in PRODUCT_URLS:
                     try:
-                        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                        await page.goto(url)  # simplified (networkidle/domcontentloaded can be finicky under blocking)
                     except Exception as e:
                         log(f"[{url}] Navigation failed (skipping): {e}")
                         continue
@@ -130,21 +181,60 @@ async def main():
                         await dismiss_overlays(page)
                         in_stock = await is_in_stock(page)
                         log(f"[{url}] In stock? {in_stock}")
-                        was = last_seen_instock.get(url, False)
 
+                        was = last_seen_instock.get(url, False)
                         if in_stock and not was:
                             title = "POP MART Stock Alert"
                             msg = f"In stock: {url}"
                             iphone_push(title, msg, url)
 
                         last_seen_instock[url] = in_stock
+
                     except Exception as e:
                         log(f"[{url}] Check failed: {e}")
 
+                # Recycle browser/context periodically (helps memory on small instances)
+                if loop_count % LOOP_RESTART == 0:
+                    try:
+                        await page.close()
+                        await context.close()
+                    except Exception:
+                        pass
+                    browser = await p.chromium.launch(
+                        headless=True,
+                        args=[
+                            "--no-sandbox",
+                            "--disable-setuid-sandbox",
+                            "--disable-dev-shm-usage",
+                            "--single-process",
+                            "--disable-gpu",
+                            "--no-zygote",
+                        ]
+                    )
+                    context = await browser.new_context(
+                        user_agent=(
+                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/120.0.0.0 Safari/537.36"
+                        ),
+                        viewport={"width": 1024, "height": 700},
+                        java_script_enabled=True,
+                        accept_downloads=False,
+                    )
+                    await enable_light_mode(context)
+                    page = await context.new_page()
+                    page.set_default_navigation_timeout(60000)
+                    page.set_default_timeout(20000)
+                    log("Recycled browser/context to keep memory low.")
+
                 await asyncio.sleep(CHECK_EVERY_SECONDS)
         finally:
-            await context.close()
-            await browser.close()
+            try:
+                await page.close()
+                await context.close()
+                await browser.close()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     try:
