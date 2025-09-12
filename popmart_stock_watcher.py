@@ -103,8 +103,9 @@ async def is_in_stock(page):
 async def main():
     log("Starting POP MART stock watcher (cloud)…")
     async with async_playwright() as p:
-        # Mimic a real browser (helps reduce blocks)
-        context = await p.chromium.new_context(user_agent=(
+        # ✅ FIX: launch a browser, then create a context
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(user_agent=(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0.0.0 Safari/537.36"
@@ -116,30 +117,34 @@ async def main():
 
         last_seen_instock = {url: False for url in PRODUCT_URLS}
 
-        while True:
-            for url in PRODUCT_URLS:
-                try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                except Exception as e:
-                    log(f"[{url}] Navigation failed (skipping): {e}")
-                    continue
+        try:
+            while True:
+                for url in PRODUCT_URLS:
+                    try:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    except Exception as e:
+                        log(f"[{url}] Navigation failed (skipping): {e}")
+                        continue
 
-                try:
-                    await dismiss_overlays(page)
-                    in_stock = await is_in_stock(page)
-                    log(f"[{url}] In stock? {in_stock}")
-                    was = last_seen_instock.get(url, False)
+                    try:
+                        await dismiss_overlays(page)
+                        in_stock = await is_in_stock(page)
+                        log(f"[{url}] In stock? {in_stock}")
+                        was = last_seen_instock.get(url, False)
 
-                    if in_stock and not was:
-                        title = "POP MART Stock Alert"
-                        msg = f"In stock: {url}"
-                        iphone_push(title, msg, url)
+                        if in_stock and not was:
+                            title = "POP MART Stock Alert"
+                            msg = f"In stock: {url}"
+                            iphone_push(title, msg, url)
 
-                    last_seen_instock[url] = in_stock
-                except Exception as e:
-                    log(f"[{url}] Check failed: {e}")
+                        last_seen_instock[url] = in_stock
+                    except Exception as e:
+                        log(f"[{url}] Check failed: {e}")
 
-            await asyncio.sleep(CHECK_EVERY_SECONDS)
+                await asyncio.sleep(CHECK_EVERY_SECONDS)
+        finally:
+            await context.close()
+            await browser.close()
 
 if __name__ == "__main__":
     try:
