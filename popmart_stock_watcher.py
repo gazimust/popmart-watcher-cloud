@@ -1,20 +1,24 @@
 # popmart_stock_watcher.py
-# Run in cloud (e.g., Render) as a Background Worker.
+# Two-stage, memory-friendly watcher for Render (512MB):
+#  1) Cheap HTML requests every cycle.
+#  2) Launch Playwright ONLY to confirm a "maybe in stock" URL, then close immediately.
+#
 # Env vars (Render → Environment):
-#   PUSHOVER_TOKEN = a8zxubz4ndhfdne8i5ro54n6r8fzib
-#   PUSHOVER_USER  = u7ekcakhmez4v7riffbhjscps8vecs
-#   CHECK_EVERY_SECONDS = 60           (recommended 45–90)
-#   SEND_TEST_PUSH_ON_START = 0 or 1   (optional one-time test on boot)
+#   PUSHOVER_TOKEN, PUSHOVER_USER   (required)
+#   CHECK_EVERY_SECONDS = 60..120   (recommend 90)
+#   SEND_TEST_PUSH_ON_START = 0|1   (optional)
+#   CART_URL = https://www.popmart.com/gb/cart  (optional)
 
 import asyncio
+import os
 import re
 import sys
-import os
-import requests
 from datetime import datetime
+
+import requests
 from playwright.async_api import async_playwright
 
-# === CONFIG ===
+# ===== CONFIG =====
 PRODUCT_URLS = [
     "https://www.popmart.com/gb/products/1265/THE-MONSTERS-Big-into-Energy-Series-ROCK-THE-UNIVERSE-Vinyl-Plush-Doll",
     "https://www.popmart.com/gb/products/1270/THE-MONSTERS-Pin-for-Love-Series-Vinyl-Plush-Pendant-Blind-Box-(N-Z)",
@@ -27,30 +31,28 @@ PRODUCT_URLS = [
     "https://www.popmart.com/gb/products/733/LABUBU-Time-to-Chill-Vinyl-Plush-Doll",
 ]
 
-CHECK_EVERY_SECONDS = int(os.getenv("CHECK_EVERY_SECONDS", "60"))  # cloud-friendly default
-OPEN_PAGE_WHEN_IN_STOCK = False  # no GUI in cloud
+CHECK_EVERY_SECONDS = int(os.getenv("CHECK_EVERY_SECONDS", "90"))
+CART_URL = os.getenv("CART_URL", "https://www.popmart.com/gb/cart")
 
-# Pushover via env vars (safer). Your values will be injected by Render.
 PUSHOVER_TOKEN = os.getenv("PUSHOVER_TOKEN", "")
-PUSHOVER_USER  = os.getenv("PUSHOVER_USER", "")
-
-# Optional: set 1 to send a one-time push on startup (good for testing)
+PUSHOVER_USER = os.getenv("PUSHOVER_USER", "")
 SEND_TEST_PUSH_ON_START = os.getenv("SEND_TEST_PUSH_ON_START", "0") == "1"
 
-# Texts used by shops
-CANDIDATE_ADD_TEXTS = [
-    "Add to Cart", "Add To Cart", "Add to Bag", "Add To Bag",
-    "Add to Basket", "Add To Basket", "Buy Now", "Purchase",
-]
-SOLD_OUT_TEXTS = ["Sold Out", "Out of Stock", "Out Of Stock", "Unavailable"]
-NOTIFY_ME_TEXTS = ["Notify Me", "Email Me When Available", "Back in Stock"]
+UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+# Text patterns
+BTN_PATTERNS = re.compile(r"(Add\s+to\s+(Cart|Bag|Basket)|Buy\s+Now|Purchase)", re.I)
+SOLD_OUT_PATTERNS = re.compile(r"(Sold\s*Out|Out\s*of\s*Stock|Unavailable)", re.I)
+NOTIFY_PATTERNS = re.compile(r"(Notify\s*Me|Email\s*Me\s*When\s*Available|Back\s*in\s*Stock)", re.I)
 
 def log(msg: str) -> None:
-    stamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"[{stamp}] {msg}", flush=True)
+    print(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}] {msg}", flush=True)
 
 def iphone_push(title: str, message: str, url: str | None = None):
-    """Send a push to your iPhone via Pushover."""
     if not PUSHOVER_TOKEN or not PUSHOVER_USER:
         log("Pushover not configured; skipping push.")
         return
@@ -64,170 +66,78 @@ def iphone_push(title: str, message: str, url: str | None = None):
     except Exception as e:
         log(f"Pushover exception: {e}")
 
-async def click_if_exists(page, role_name_regex_list):
-    """Try clicking common cookie/consent/close buttons if they appear."""
-    for pat in role_name_regex_list:
-        try:
-            locator = page.get_by_role("button", name=re.compile(pat, re.I))
-            if await locator.count() > 0:
-                btn = locator.nth(0)
-                if await btn.is_visible():
-                    await btn.click(timeout=2000)
-        except Exception:
-            pass
-
-async def dismiss_overlays(page):
-    await click_if_exists(page, [
-        r"Accept All", r"Accept", r"Agree", r"OK", r"Got it",
-        r"Close", r"Continue", r"I Understand", r"Allow all",
-    ])
-
-async def page_has_any_text(page, texts):
+def cheap_html_check(url: str) -> tuple[bool, str]:
+    """
+    Return (maybe_in_stock, reason). Uses plain HTML (no JS).
+    'maybe_in_stock' means we found buy-ish text and did NOT find sold-out/notify text.
+    """
     try:
-        html = await page.content()
-        lower = html.lower()
-        return any(t.lower() in lower for t in texts)
-    except Exception:
-        return False
+        resp = requests.get(url, headers={"User-Agent": UA, "Accept": "text/html"}, timeout=20)
+        resp.raise_for_status()
+        html = resp.text
+        has_buy = bool(BTN_PATTERNS.search(html))
+        has_sold = bool(SOLD_OUT_PATTERNS.search(html))
+        has_notify = bool(NOTIFY_PATTERNS.search(html))
+        if has_buy and not (has_sold or has_notify):
+            return True, "buy-text-without-sold/notify"
+        return False, ("sold/notify" if (has_sold or has_notify) else "buy-not-found")
+    except Exception as e:
+        return False, f"http-error: {e}"
 
-async def find_enabled_buy_button(page):
-    for t in CANDIDATE_ADD_TEXTS:
-        try:
-            locator = page.get_by_role("button", name=re.compile(t, re.I))
-            if await locator.count() > 0:
-                btn = locator.nth(0)
-                if await btn.is_visible() and await btn.is_enabled():
-                    return True
-        except Exception:
-            continue
-    return False
-
-async def is_in_stock(page):
-    if await find_enabled_buy_button(page):
-        return True
-    if await page_has_any_text(page, SOLD_OUT_TEXTS):
-        return False
-    if await page_has_any_text(page, NOTIFY_ME_TEXTS):
-        return False
-    return False
-
-async def enable_light_mode(context):
+async def confirm_with_playwright(maybe_url: str) -> bool:
     """
-    Block heavy resources to cut CPU/RAM/network.
+    Launch a tiny headless Chromium, block heavy resources, and confirm stock for ONE url.
+    Immediately close everything afterward to keep memory low.
     """
-    async def route_block(route):
-        req = route.request
-        if req.resource_type in ("image", "media", "font", "stylesheet"):
-            return await route.abort()
-        return await route.continue_()
-    await context.route("**/*", route_block)
-
-async def main():
-    log("Starting POP MART stock watcher (cloud, light mode)…")
     async with async_playwright() as p:
-        # Launch headless Chromium with low-memory flags
         browser = await p.chromium.launch(
             headless=True,
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",   # use /tmp instead of /dev/shm
-                "--single-process",          # fewer processes (saves RAM)
+                "--disable-dev-shm-usage",
+                "--single-process",
                 "--disable-gpu",
                 "--no-zygote",
-            ]
+            ],
         )
-
-        # Create a lightweight context
         context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
+            user_agent=UA,
             viewport={"width": 1024, "height": 700},
             java_script_enabled=True,
             accept_downloads=False,
         )
 
-        # Block heavy resources
-        await enable_light_mode(context)
+        # Block heavy assets
+        async def route_block(route):
+            r = route.request
+            if r.resource_type in ("image", "media", "font", "stylesheet"):
+                return await route.abort()
+            return await route.continue_()
+        await context.route("**/*", route_block)
 
         page = await context.new_page()
         page.set_default_navigation_timeout(60000)
         page.set_default_timeout(20000)
 
-        # Optional one-time test push at boot
-        if SEND_TEST_PUSH_ON_START:
-            iphone_push("Pushover Test", "Cloud watcher started OK.", PRODUCT_URLS[0])
-
-        # Track previous state to avoid duplicate alerts
-        last_seen_instock = {url: False for url in PRODUCT_URLS}
-
-        LOOP_RESTART = 200  # recycle the browser every N loops to avoid leaks
-        loop_count = 0
-
         try:
-            while True:
-                loop_count += 1
-                for url in PRODUCT_URLS:
-                    try:
-                        await page.goto(url)  # simplified (networkidle/domcontentloaded can be finicky under blocking)
-                    except Exception as e:
-                        log(f"[{url}] Navigation failed (skipping): {e}")
-                        continue
+            await page.goto(maybe_url)
+            # Try button detection
+            try:
+                for pat in ("Add to Cart", "Add To Cart", "Add to Bag", "Add To Bag",
+                            "Add to Basket", "Add To Basket", "Buy Now", "Purchase"):
+                    loc = page.get_by_role("button", name=re.compile(pat, re.I))
+                    if await loc.count() > 0:
+                        if await loc.nth(0).is_visible() and await loc.nth(0).is_enabled():
+                            return True
+            except Exception:
+                pass
 
-                    try:
-                        await dismiss_overlays(page)
-                        in_stock = await is_in_stock(page)
-                        log(f"[{url}] In stock? {in_stock}")
-
-                        was = last_seen_instock.get(url, False)
-                        if in_stock and not was:
-                            title = "POP MART Stock Alert"
-                            msg = f"In stock: {url}"
-                            iphone_push(title, msg, url)
-
-                        last_seen_instock[url] = in_stock
-
-                    except Exception as e:
-                        log(f"[{url}] Check failed: {e}")
-
-                # Recycle browser/context periodically (helps memory on small instances)
-                if loop_count % LOOP_RESTART == 0:
-                    try:
-                        await page.close()
-                        await context.close()
-                    except Exception:
-                        pass
-                    browser = await p.chromium.launch(
-                        headless=True,
-                        args=[
-                            "--no-sandbox",
-                            "--disable-setuid-sandbox",
-                            "--disable-dev-shm-usage",
-                            "--single-process",
-                            "--disable-gpu",
-                            "--no-zygote",
-                        ]
-                    )
-                    context = await browser.new_context(
-                        user_agent=(
-                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/120.0.0.0 Safari/537.36"
-                        ),
-                        viewport={"width": 1024, "height": 700},
-                        java_script_enabled=True,
-                        accept_downloads=False,
-                    )
-                    await enable_light_mode(context)
-                    page = await context.new_page()
-                    page.set_default_navigation_timeout(60000)
-                    page.set_default_timeout(20000)
-                    log("Recycled browser/context to keep memory low.")
-
-                await asyncio.sleep(CHECK_EVERY_SECONDS)
+            # Fallback: text scan
+            html = await page.content()
+            if BTN_PATTERNS.search(html) and not (SOLD_OUT_PATTERNS.search(html) or NOTIFY_PATTERNS.search(html)):
+                return True
+            return False
         finally:
             try:
                 await page.close()
@@ -235,6 +145,42 @@ async def main():
                 await browser.close()
             except Exception:
                 pass
+
+async def main():
+    log("Starting POP MART stock watcher (Two-stage / low memory)…")
+
+    if SEND_TEST_PUSH_ON_START:
+        iphone_push("Pushover Test", "Cloud watcher started OK.", PRODUCT_URLS[0])
+
+    # Track last status to avoid duplicate pings
+    last_seen_instock = {u: False for u in PRODUCT_URLS}
+
+    while True:
+        # 1) Cheap pass over all URLs
+        candidates: list[str] = []
+        for url in PRODUCT_URLS:
+            maybe, reason = cheap_html_check(url)
+            log(f"[cheap] {url} → maybe={maybe} ({reason})")
+            if maybe:
+                candidates.append(url)
+
+        # 2) Confirm each candidate with a short Playwright session (one by one)
+        for url in candidates:
+            log(f"[confirm] Launching Chromium briefly for: {url}")
+            try:
+                is_real = await confirm_with_playwright(url)
+                log(f"[confirm] {url} → in_stock={is_real}")
+                was = last_seen_instock.get(url, False)
+                if is_real and not was:
+                    title = "POP MART Stock Alert"
+                    msg = f"In stock:\n{url}\n\nCart (open after adding):\n{CART_URL}"
+                    iphone_push(title, msg, url)
+                last_seen_instock[url] = is_real
+            except Exception as e:
+                log(f"[confirm] error for {url}: {e}")
+
+        # 3) Sleep until next cycle
+        await asyncio.sleep(CHECK_EVERY_SECONDS)
 
 if __name__ == "__main__":
     try:
